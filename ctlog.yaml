@@ -1,0 +1,258 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ctlog-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: release-name-ctlog-createctconfig
+  namespace: ctlog-system
+  labels:
+    sigstore.app: ctlog
+  annotations:
+    {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ctlog-createtree
+  namespace: ctlog-system
+  labels:
+    sigstore.app: ctlog
+  annotations:
+    {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ctlog
+  namespace: ctlog-system
+  labels:
+    sigstore.app: ctlog
+  annotations:
+    {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ctlog-config
+  namespace: ctlog-system
+  labels:
+    sigstore.app: ctlog
+data:
+  __placeholder: |
+    ###################################################################
+    # Just a placeholder so that reapplying this won't overwrite treeID
+    # if it already exists. This caused grief, do not remove.
+    ###################################################################
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ctlog-cm-operator
+  namespace: ctlog-system
+  labels:
+    sigstore.app: ctlog
+rules:
+  - apiGroups: [""] # "" indicates the core API group
+    resources: ["configmaps"]
+    resourceNames: ["ctlog-config"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ctlog-secret-operator
+  namespace: ctlog-system
+  labels:
+    sigstore.app: ctlog
+rules:
+  - apiGroups: [""] # "" indicates the core API group
+    resources: ["configmaps"]
+    resourceNames: ["ctlog-config"]
+    verbs: ["get", "update"]
+  - apiGroups: [""] # "" indicates the core API group
+    resources: ["secrets"]
+    verbs: ["create", "get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ctlog-cm-operator
+  namespace: ctlog-system
+  labels:
+    sigstore.app: ctlog
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ctlog-cm-operator
+subjects:
+  - kind: ServiceAccount
+    name: ctlog-createtree
+    namespace: ctlog-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ctlog-secret-operator
+  namespace: ctlog-system
+  labels:
+    sigstore.app: ctlog
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ctlog-secret-operator
+subjects:
+  - kind: ServiceAccount
+    name: release-name-ctlog-createctconfig
+    namespace: ctlog-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    sigstore.app: ctlog
+  name: ctlog
+  namespace: ctlog-system
+spec:
+  ports:
+    - name: 6962-tcp
+      port: 80
+      protocol: TCP
+      targetPort: 6962
+    - name: 6963-tcp
+      port: 6963
+      protocol: TCP
+      targetPort: 6963
+  selector:
+    sigstore.app: ctlog
+  type: "ClusterIP"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ctlog
+  namespace: ctlog-system
+  labels:
+    sigstore.app: ctlog
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      sigstore.app: ctlog
+  template:
+    metadata:
+      annotations:
+        checksum/config: cf0c7356684da02dd450d807dfa9ceb9ac20d0c62dabb283602987aacd28177b
+        prometheus.io/path: /metrics
+        prometheus.io/port: "6963"
+        prometheus.io/scrape: "true"
+      labels:
+        sigstore.app: ctlog
+    spec:
+      serviceAccountName: ctlog
+      containers:
+        - name: ctlog
+          image: "ghcr.io/sigstore/scaffolding/ct_server@sha256:7c791d3b7c15e817807f07d4cdb00406529a114702ad448ee857e1d0fc5fb5a9"
+          imagePullPolicy: "IfNotPresent"
+          args:
+            - "--http_endpoint=0.0.0.0:6962"
+            - "--metrics_endpoint=0.0.0.0:6963"
+            - "--log_config=/ctfe-keys/config"
+            - "--alsologtostderr"
+          volumeMounts:
+            - name: keys
+              mountPath: "/ctfe-keys"
+              readOnly: true
+          ports:            
+            - containerPort: 6962
+              protocol: TCP
+            - containerPort: 6963
+              protocol: TCP
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65533
+      volumes:
+        - name: keys
+          secret:
+            secretName: ctlog-secret
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: release-name-ctlog-createctconfig
+  namespace: ctlog-system
+  labels:
+    sigstore.app: ctlog
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 6
+  template:
+    spec:
+      serviceAccountName: release-name-ctlog-createctconfig
+      restartPolicy: Never
+      automountServiceAccountToken: true
+      initContainers:
+        - name: "wait-for-createtree-configmap"
+          image: "docker.io/curlimages/curl@sha256:dca6e1b1c8e7b8b8e7be4e79fc78a858d12fd56245cb31bfa281dbf7c73a6498"
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "until curl --fail --header \"Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)\" --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt --max-time 10 https://kubernetes.default.svc/api/v1/namespaces/$(NAMESPACE)/configmaps/ctlog-config | grep '\"treeID\":'; do echo waiting for Configmap ctlog-config; sleep 5; done;"]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+      containers:
+        - name: release-name-ctlog-createctconfig
+          image: "ghcr.io/sigstore/scaffolding/createctconfig@sha256:b3dae896ddb7b01b3257c668bc1e87f15aafe97f30a767f99426f557fa33e44c"
+          imagePullPolicy: "IfNotPresent"
+          args: [
+            "--configmap=ctlog-config",
+            "--secret=ctlog-secret",
+            "--pubkeysecret=ctlog-public-key",
+            "--fulcio-url=http://fulcio-server.fulcio-system.svc",
+            "--trillian-server=trillian-logserver.trillian-system:8091",
+            "--log-prefix=sigstorescaffolding"
+          ]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65533
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ctlog-createtree
+  namespace: ctlog-system
+  labels:
+    sigstore.app: ctlog
+spec:
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      serviceAccountName: ctlog-createtree
+      restartPolicy: Never
+      automountServiceAccountToken: true
+      containers:
+        - name: ctlog-createtree
+          image: "ghcr.io/sigstore/scaffolding/createtree@sha256:d5776d8a43632291e1c5a22a9266608db0daa0a11663445d701e327f2205974c"
+          imagePullPolicy: "IfNotPresent"
+          env:
+          - name: NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          args: [
+            "--namespace=$(NAMESPACE)",
+            "--configmap=ctlog-config",
+            "--display_name=ctlog-tree",
+            "--admin_server=trillian-logserver.trillian-system:8091"
+          ]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65533
