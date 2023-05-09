@@ -1,0 +1,228 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fulcio-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fulcio-createcerts
+  namespace: fulcio-system
+  labels:
+    sigstore.app: fulcio
+  annotations:
+    {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fulcio-server
+  namespace: fulcio-system
+  labels:
+    sigstore.app: fulcio
+  annotations:
+    {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fulcio-server-config
+  namespace: fulcio-system
+  labels:
+    sigstore.app: fulcio
+data:
+  config.json: |-
+    {
+      "OIDCIssuers": {
+        "https://kubernetes.default.svc": {
+          "IssuerURL": "https://kubernetes.default.svc",
+          "ClientID": "sigstore",
+          "Type": "kubernetes"
+        }
+      },
+      "MetaIssuers": {
+        "https://kubernetes.*.svc": {
+          "ClientID": "sigstore",
+          "Type": "kubernetes"
+        }
+      }
+    }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fulcio-server-secret-operator
+  namespace: fulcio-system
+  labels:
+    sigstore.app: fulcio
+rules:
+  - apiGroups: [""] # "" indicates the core API group
+    resources: ["secrets"]
+    verbs: ["create", "get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fulcio-server-secret-operator
+  namespace: fulcio-system
+  labels:
+    sigstore.app: fulcio
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fulcio-server-secret-operator
+subjects:
+  - kind: ServiceAccount
+    name: fulcio-createcerts
+    namespace: fulcio-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    sigstore.app: fulcio
+  name: fulcio-server
+  namespace: fulcio-system
+spec:
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 5555
+    - name: grpc
+      port: 5554
+      protocol: TCP
+      targetPort: 5554
+    - name: 2112-tcp
+      port: 2112
+      protocol: TCP
+      targetPort: 2112
+  selector:
+    sigstore.app: fulcio
+  type: "ClusterIP"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fulcio-server
+  namespace: fulcio-system
+  labels:
+    sigstore.app: fulcio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      sigstore.app: fulcio
+  template:
+    metadata:
+      annotations:
+        checksum/config: 3dfa5f8a985e88bb02fb450736ffe6a3fea46013c126dfb414696d4f90abc34b
+      labels:
+        sigstore.app: fulcio
+    spec:
+      serviceAccountName: fulcio-server
+      automountServiceAccountToken: true
+      containers:
+        - name: fulcio-server
+          image: "gcr.io/projectsigstore/fulcio@sha256:c920be2d367214562cda7d53d3af3529edf2dfd9326b24909ece450092b97b18"
+          imagePullPolicy: "IfNotPresent"
+          ports:            
+            - containerPort: 5555
+              protocol: TCP
+            - containerPort: 5554
+              protocol: TCP
+            - containerPort: 2112
+              protocol: TCP
+          args:
+            - "serve"
+            - "--port=5555"
+            - "--grpc-port=5554"
+            - "--ca=fileca"
+            - "--fileca-key"
+            - "/var/run/fulcio-secrets/key.pem"
+            - "--fileca-cert"
+            - "/var/run/fulcio-secrets/cert.pem"
+            - "--fileca-key-passwd"
+            - "$(PASSWORD)"
+            - "--ct-log-url=http://ctlog.ctlog-system.svc/sigstorescaffolding"
+          env:
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fulcio-server-secret
+                  key: password
+          volumeMounts:
+            - name: fulcio-config
+              mountPath: /etc/fulcio-config
+            - name: oidc-info
+              mountPath: /var/run/fulcio
+            - name: fulcio-cert
+              mountPath: "/var/run/fulcio-secrets"
+              readOnly: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65533
+      volumes:
+        - name: fulcio-config
+          configMap:
+            name: fulcio-server-config
+        - name: oidc-info
+          projected:
+            sources:
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+                      mode: 0666
+        - name: fulcio-cert
+          secret:
+            secretName: fulcio-server-secret
+            items:
+              - key: private
+                path: key.pem
+              - key: cert
+                path: cert.pem
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fulcio-createcerts
+  namespace: fulcio-system
+spec:
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      serviceAccountName: fulcio-createcerts
+      restartPolicy: Never
+      automountServiceAccountToken: true
+      containers:
+        - name: fulcio-createcerts
+          image: "ghcr.io/sigstore/scaffolding/createcerts@sha256:73e7ac35d0e5169bd14a5cb6caed2e7d44277dec3d1de92e08f4d055523089a1"
+          imagePullPolicy: "IfNotPresent"
+          args: ["--secret=fulcio-server-secret"]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65533
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  labels:
+    sigstore.app: fulcio
+  name: fulcio-server-http
+  namespace: fulcio-system
+  annotations:
+    {}
+spec:
+  host: fulcio.localhost
+  port:
+    targetPort: 80
+  to:
+    kind: Service
+    name: fulcio-server
